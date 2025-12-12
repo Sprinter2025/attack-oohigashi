@@ -6,9 +6,10 @@
 // - Floaters/Particles: in-place compaction (NO Array.filter allocations)
 // - Sounds: WebAudio (AudioBuffer) + throttle (fix tap-stutter)
 // - IMPORTANT: WAIT for audio decode BEFORE starting the game (prevents mid-reset)
-// - Colors: dark background scheme (like old black BG)
-// - Mobile: character speed tuned (0.625 of PC)
-// - Shadow: more whitish
+// - Combo spec:
+//   - comboが10の倍数ごとに +5pt（フィーバー中はx2）
+//   - comboが50達成ごとにFEVER突入（50,100,150...で再突入=タイマ更新）
+// - Variable particles: combo / feverで粒子数を増やす
 
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d", { alpha: false });
@@ -87,7 +88,7 @@ let gainSe = null;
 let buffers = { hit01: null, hit02: null, count: null, bgm: null };
 let bgmSource = null;
 
-// ★追加：ロード多重実行防止 & START中ガード
+// ★ロード多重実行防止 & START中ガード
 let audioReadyPromise = null;
 let isStarting = false;
 
@@ -101,39 +102,69 @@ function setButtonLoading(on) {
   }
 }
 
+function audioIsReady() {
+  return !!(audioCtx && buffers.hit01 && buffers.hit02 && buffers.count && buffers.bgm);
+}
+
+// ★失敗しても復帰できるensureAudio
 async function ensureAudio() {
-  // ★同時に複数回走らないようにする
+  if (audioIsReady()) return;
+
   if (audioReadyPromise) return audioReadyPromise;
-  if (audioCtx) return;
 
   audioReadyPromise = (async () => {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    try {
+      // 途中で壊れてたら作り直す
+      if (audioCtx) {
+        try { audioCtx.close(); } catch (_) {}
+      }
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
-    gainBgm = audioCtx.createGain();
-    gainSe = audioCtx.createGain();
-    gainBgm.gain.value = 0.18; // bgm volume
-    gainSe.gain.value = 0.85;  // se volume
-    gainBgm.connect(audioCtx.destination);
-    gainSe.connect(audioCtx.destination);
+      gainBgm = audioCtx.createGain();
+      gainSe = audioCtx.createGain();
+      gainBgm.gain.value = 0.18; // bgm volume
+      gainSe.gain.value = 0.85;  // se volume
+      gainBgm.connect(audioCtx.destination);
+      gainSe.connect(audioCtx.destination);
 
-    async function loadBuf(url) {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`fetch failed ${res.status}: ${url}`);
-      const arr = await res.arrayBuffer();
-      return await audioCtx.decodeAudioData(arr);
+      async function loadBuf(url) {
+        const res = await fetch(url, { cache: "no-store" });
+        if (!res.ok) {
+          throw new Error(`fetch failed ${res.status}: ${url}`);
+        }
+        const arr = await res.arrayBuffer();
+        try {
+          return await audioCtx.decodeAudioData(arr);
+        } catch (e) {
+          throw new Error(`decodeAudioData failed: ${url}`);
+        }
+      }
+
+      const [b1, b2, b3, b4] = await Promise.all([
+        loadBuf("./assets/hit01.mp3"),
+        loadBuf("./assets/hit02.mp3"),
+        loadBuf("./assets/count.mp3"),
+        loadBuf("./assets/bgm.mp3"),
+      ]);
+
+      buffers.hit01 = b1;
+      buffers.hit02 = b2;
+      buffers.count = b3;
+      buffers.bgm = b4;
+
+    } catch (e) {
+      // ★重要：失敗したら次回やり直せるように戻す
+      audioReadyPromise = null;
+      if (audioCtx) {
+        try { audioCtx.close(); } catch (_) {}
+      }
+      audioCtx = null;
+      gainBgm = null;
+      gainSe = null;
+      buffers = { hit01: null, hit02: null, count: null, bgm: null };
+      bgmSource = null;
+      throw e;
     }
-
-    const [b1, b2, b3, b4] = await Promise.all([
-      loadBuf("./assets/hit01.mp3"),
-      loadBuf("./assets/hit02.mp3"),
-      loadBuf("./assets/count.mp3"),
-      loadBuf("./assets/bgm.mp3"),
-    ]);
-
-    buffers.hit01 = b1;
-    buffers.hit02 = b2;
-    buffers.count = b3;
-    buffers.bgm = b4;
   })();
 
   return audioReadyPromise;
@@ -182,12 +213,17 @@ const INTRO_RETRY_SECONDS = 3.0;
 const GO_HOLD_SECONDS = 1.0;
 const GAME_SECONDS = 30.0;
 
+// ---- combo/fever spec ----
+const COMBO_BONUS_EVERY = 10;  // 10の倍数ごと
+const COMBO_BONUS_PTS = 5;     // +5pt
+const FEVER_EVERY = 50;        // 50達成ごと
+const FEVER_SECONDS = 7.0;     // fever持続（好きに調整OK）
+
 // 速度の上限（暴走防止）
 function speedLimit() {
   const { w, h } = getViewportSize();
   const s = Math.min(w, h);
   const base = clamp(s * 0.85, 520, 900);
-  // ★スマホは 0.625 (= 0.5 * 1.25) に調整
   return IS_MOBILE ? base * 0.625 : base;
 }
 
@@ -258,9 +294,9 @@ function addFloater(text, x, y, opts = {}) {
   });
 }
 
-function startFever(seconds = 7.0) {
+function startFever(seconds = FEVER_SECONDS) {
   state.fever = true;
-  state.feverTimer = seconds;
+  state.feverTimer = seconds;  // ★再突入でタイマ更新
   state.scoreMul = 2;
 
   playHitBonus();
@@ -307,7 +343,6 @@ function resetGameForIntro(introSeconds) {
   state.face.x = rand(state.face.r, w - state.face.r);
   state.face.y = rand(state.face.r + 90, h - state.face.r);
 
-  // ★スマホは動き 0.625 に調整
   const spMul = IS_MOBILE ? 0.625 : 1.0;
 
   const baseVx = rand(220, 340) * spMul * (Math.random() < 0.5 ? -1 : 1);
@@ -371,7 +406,7 @@ function endGame() {
   btn.textContent = "RETRY";
 }
 
-// ★修正：音声ロード(decode)完了までゲーム開始しない + 二重起動防止 + LOADING表示
+// ★音声ロード(decode)完了までゲーム開始しない + 二重起動防止 + LOADING表示
 async function startGame() {
   if (isStarting) return;
   isStarting = true;
@@ -406,7 +441,7 @@ async function startGame() {
     console.error(e);
     overlay.classList.remove("hidden");
     titleEl.textContent = "AUDIO ERROR";
-    resultEl.textContent = "音声の読み込みに失敗（assetsパス/サーバ起動を確認）";
+    resultEl.textContent = String(e?.message || "音声の読み込みに失敗（assetsパス/サーバ起動を確認）");
     btn.textContent = "RETRY";
   } finally {
     setButtonLoading(false);
@@ -424,6 +459,23 @@ function getPointerPos(e) {
   return { x, y };
 }
 
+function particleCountForHit() {
+  // 基本
+  let n = 18;
+
+  // comboが伸びるほど少し増える（上限つき）
+  // 例：combo 0→18, 10→24, 30→30, 50→34
+  n = clamp(18 + state.combo * 0.6, 18, 34);
+
+  // FEVER中はさらに増える
+  if (state.fever) n = Math.floor(n * 1.6);
+
+  // 10の倍数ヒットは気持ち追加
+  if (state.combo > 0 && (state.combo % COMBO_BONUS_EVERY === 0)) n += 10;
+
+  return n;
+}
+
 canvas.addEventListener("pointerdown", (e) => {
   if (!state.running) return;
   if (state.phase !== "play") return;
@@ -431,13 +483,14 @@ canvas.addEventListener("pointerdown", (e) => {
   const { x, y } = getPointerPos(e);
 
   if (pointInFace(x, y)) {
+    // combo更新
     if (state.comboTimer > 0) state.combo += 1;
     else state.combo = 1;
     state.comboTimer = state.comboWindow;
 
+    // 基本加点
     const add = 1 * state.scoreMul;
     state.score += add;
-    elScore.textContent = String(state.score);
 
     addFloater(`+${add}`, state.face.x, state.face.y - state.face.r * 0.15, {
       size: IS_MOBILE ? 24 : 28, life: 0.60, rise: 120, wobble: 8, weight: 900
@@ -445,10 +498,10 @@ canvas.addEventListener("pointerdown", (e) => {
 
     playHitNormal();
 
-    if (state.combo === 5) {
-      const bonus = 10 * state.scoreMul;
+    // ★10の倍数ごとに +5pt（フィーバー中はx2）
+    if (state.combo % COMBO_BONUS_EVERY === 0) {
+      const bonus = COMBO_BONUS_PTS * state.scoreMul;
       state.score += bonus;
-      elScore.textContent = String(state.score);
 
       addFloater(`+${bonus} BONUS!!`, state.face.x, state.face.y, {
         size: IS_MOBILE ? 34 : 44, life: 0.95, rise: 150, wobble: 18, weight: 1000
@@ -458,9 +511,12 @@ canvas.addEventListener("pointerdown", (e) => {
       state.shake = Math.max(state.shake, IS_MOBILE ? 0.26 : 0.33);
     }
 
-    if (state.combo === 10 && !state.fever) {
-      startFever(3.0);
+    // ★50combo達成ごとにFEVER突入（50,100,150...）
+    if (state.combo % FEVER_EVERY === 0) {
+      startFever(FEVER_SECONDS);
     }
+
+    elScore.textContent = String(state.score);
 
     state.face.hitTimer = 0.18;
     state.face.scalePop = 0.20;
@@ -470,7 +526,8 @@ canvas.addEventListener("pointerdown", (e) => {
       (state.fever ? (IS_MOBILE ? 0.16 : 0.20) : (IS_MOBILE ? 0.13 : 0.16)) + Math.min(0.22, state.combo * 0.012)
     );
 
-    spawnParticles(state.face.x, state.face.y, 26);
+    // ★可変粒子（combo/feverで増える）
+    spawnParticles(state.face.x, state.face.y, particleCountForHit());
 
     const mult = rand(0.97, 1.05);
     state.face.vx *= mult;
@@ -538,7 +595,7 @@ function update(dt) {
       return;
     }
 
-    state.introLeft = Math.max(0, state.introLeft - dt);
+    state.introLeft = Math.max(0, Math.min(state.introTotal, state.introLeft - dt));
     elTime.textContent = GAME_SECONDS.toFixed(1);
 
     if (!state.countPlayed && state.introLeft <= 3.0) {
@@ -619,7 +676,6 @@ function drawIntroCountdown() {
   ctx.textBaseline = "middle";
 
   ctx.font = `900 24px system-ui, sans-serif`;
-  // shadow
   ctx.fillStyle = "rgba(0,0,0,0.55)";
   ctx.fillText("GET READY", w / 2 + 2, h / 2 - 110 + 2);
   ctx.fillStyle = "rgba(255,255,255,0.98)";
@@ -675,11 +731,11 @@ function draw() {
   // floaters
   for (let i = 0; i < state.floaters.length; i++) {
     const ft = state.floaters[i];
-    const p = ft.t / ft.life;
-    const ease = 1 - Math.pow(1 - p, 3);
+    const pp = ft.t / ft.life;
+    const ease = 1 - Math.pow(1 - pp, 3);
     const yy = ft.y0 - ft.rise * ease;
-    const xx = ft.x0 + Math.sin(p * Math.PI * 2) * ft.wobble;
-    const alpha = 1 - p;
+    const xx = ft.x0 + Math.sin(pp * Math.PI * 2) * ft.wobble;
+    const alpha = 1 - pp;
 
     ctx.globalAlpha = alpha;
     ctx.font = `${ft.weight} ${ft.size}px system-ui, sans-serif`;
@@ -701,7 +757,7 @@ function draw() {
   const pop = (f.scalePop > 0) ? (1 + 0.18 * (f.scalePop / 0.20)) : 1;
   const size = (f.r * 2) * pop;
 
-  // ---- shadow: more whitish ----
+  // shadow
   ctx.globalAlpha = 0.32;
   ctx.beginPath();
   ctx.ellipse(f.x, f.y + f.r * 0.78, f.r * 0.95, f.r * 0.35, 0, 0, Math.PI * 2);
@@ -752,8 +808,8 @@ function draw() {
       drawHudText(`COMBO: ${state.combo}`, hudX, hudY, `900 20px system-ui, sans-serif`);
     }
     if (state.fever) {
-      const t = Math.max(0, state.feverTimer).toFixed(1);
-      drawHudText(`FEVER x2  ${t}s`, hudX, hudY + lineH, `900 22px system-ui, sans-serif`);
+      const tt = Math.max(0, state.feverTimer).toFixed(1);
+      drawHudText(`FEVER x2  ${tt}s`, hudX, hudY + lineH, `900 22px system-ui, sans-serif`);
     }
   }
 

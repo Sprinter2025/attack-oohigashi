@@ -2,14 +2,12 @@
 // - iOS Safari bottom bar safe: use visualViewport for sizing
 // - Tap hitbox bigger on mobile
 // - Performance: cap DPR to 2, reduce particles/floaters, thinner strokes on mobile
-// - Particles: use pre-rendered sprite + MAX_PARTICLES cap (fast)
-// - Sounds: throttle SE on mobile (avoid audio spam stutter)
-// - FIX: heavy on rapid hits ->
-//   * 1-frame hit lock
-//   * DOM score update only once per frame (dirty flag)
-//   * reduce particles/floaters on rapid hits
-//   * skip strokeText on mobile (floaters/HUD)
+// - Particles: sprite + pool (no GC burst)
+// - Floaters: pool (no GC burst)
+// - Input: queue taps, process max 1 per frame
+// - DOM: score update once per frame
 // - Background: pale gray
+// - Sounds: audio pool + throttle
 
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
@@ -39,7 +37,7 @@ function getViewportSize() {
 
 function fitCanvas() {
   const { w, h } = getViewportSize();
-  const dpr = Math.min(2, Math.max(1, window.devicePixelRatio || 1)); // cap for performance
+  const dpr = Math.min(2, Math.max(1, window.devicePixelRatio || 1)); // cap
   canvas.style.width = w + "px";
   canvas.style.height = h + "px";
   canvas.width = Math.floor(w * dpr);
@@ -76,9 +74,9 @@ makeDotSprite();
 const assets = {
   face: new Image(),
   faceHit: new Image(),
-  hit01: null,   // normal hit
-  hit02: null,   // bonus hit
-  count: null,   // countdown (3..2..1..GO in one file)
+  hit01: null,
+  hit02: null,
+  count: null,
   bgm: null,
 };
 
@@ -93,7 +91,7 @@ function safeAudio(src, loop = false, volume = 0.6) {
   return a;
 }
 
-// ---- audio pool (better for rapid taps on mobile) ----
+// ---- audio pool (rapid taps friendly) ----
 function makeAudioPool(src, size = 6, volume = 0.7) {
   const list = [];
   for (let i = 0; i < size; i++) {
@@ -107,30 +105,22 @@ function makeAudioPool(src, size = 6, volume = 0.7) {
 }
 
 function initAudio() {
-  // BGM
   if (!assets.bgm) assets.bgm = safeAudio("./assets/bgm.mp3", true, 0.18);
-
-  // SE (pool)
   if (!assets.hit01) assets.hit01 = makeAudioPool("./assets/hit01.mp3", IS_MOBILE ? 4 : 8, 0.75);
   if (!assets.hit02) assets.hit02 = makeAudioPool("./assets/hit02.mp3", IS_MOBILE ? 3 : 6, 0.85);
-
-  // Countdown (pool small)
   if (!assets.count) assets.count = makeAudioPool("./assets/count.mp3", 2, 0.75);
 }
 
-// ---- audio throttle (mobile) ----
 let lastSeTime = 0;
 function playPool(pool) {
   if (!pool) return;
-
   const now = performance.now();
-  if (IS_MOBILE && now - lastSeTime < 80) return; // drop too-frequent SE
+  if (IS_MOBILE && now - lastSeTime < 80) return;
   lastSeTime = now;
 
   const a = pool.list[pool.i];
   pool.i = (pool.i + 1) % pool.list.length;
 
-  // try reset but tolerate failures on some browsers
   try { a.pause(); } catch {}
   try { a.currentTime = 0; } catch {}
   a.play().catch(() => {});
@@ -151,37 +141,31 @@ elBest.textContent = best.toString();
 // ★ここが要望
 const INTRO_FIRST_SECONDS = 7.0;
 const INTRO_RETRY_SECONDS = 3.0;
-
-// ★GOを見せる余韻（この秒数だけ待ってから play に遷移）
 const GO_HOLD_SECONDS = 1.0;
-
 const GAME_SECONDS = 30.0;
 
 // 速度の上限（暴走防止）
 function speedLimit() {
   const { w, h } = getViewportSize();
   const s = Math.min(w, h);
-  return clamp(s * 0.85, 520, 900); // px/s
+  return clamp(s * 0.85, 520, 900);
 }
 
 const state = {
   running: false,
   lastT: 0,
 
-  // phase: "intro" -> "play"
   phase: "intro",
   introLeft: INTRO_FIRST_SECONDS,
   introTotal: INTRO_FIRST_SECONDS,
 
-  // ★カウントダウン音を一度だけ鳴らす用
   countPlayed: false,
-
-  // ★GO表示の余韻（>0 の間は intro のまま固定表示）
   goHold: 0,
 
   score: 0,
   timeLeft: GAME_SECONDS,
 
+  // pooled
   particles: [],
   floaters: [],
 
@@ -189,7 +173,7 @@ const state = {
 
   combo: 0,
   comboTimer: 0,
-  comboWindow: 1.0, // 1秒以内でコンボ継続
+  comboWindow: 1.0,
   fever: false,
   feverTimer: 0,
   scoreMul: 1,
@@ -207,26 +191,101 @@ const state = {
   }
 };
 
-let hasStartedOnce = false; // ★初回/リトライ判定
+let hasStartedOnce = false;
 
 // ---- DOM update throttle (score) ----
 let scoreDirty = true;
 function markScoreDirty() { scoreDirty = true; }
 
-// ---- 1-frame hit lock (prevent multi-hit in same frame) ----
-let hitLock = false;
-
-// ---- rapid hit detector: reduce effects only when spam tapping ----
+// ---- rapid hit detector (for effect throttle) ----
 let lastHitPerf = 0;
 function isRapidHit() {
   const now = performance.now();
-  const rapid = (now - lastHitPerf) < 70; // <70ms = spam taps
+  const rapid = (now - lastHitPerf) < 70;
   lastHitPerf = now;
   return rapid;
 }
 
+// ============================
+// Input queue: pointerdown only enqueues
+// ============================
+const tapQ = {
+  x: new Float32Array(32),
+  y: new Float32Array(32),
+  head: 0,
+  tail: 0,
+  mask: 31,
+  push(px, py) {
+    const next = (this.tail + 1) & this.mask;
+    if (next === this.head) return; // full: drop
+    this.x[this.tail] = px;
+    this.y[this.tail] = py;
+    this.tail = next;
+  },
+  pop() {
+    if (this.head === this.tail) return null;
+    const px = this.x[this.head];
+    const py = this.y[this.head];
+    this.head = (this.head + 1) & this.mask;
+    return { x: px, y: py };
+  },
+  clear() { this.head = this.tail = 0; }
+};
+
+function getPointerPos(e) {
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left);
+  const y = (e.clientY - rect.top);
+  return { x, y };
+}
+
+canvas.addEventListener("pointerdown", (e) => {
+  if (!state.running) return;
+  if (state.phase !== "play") return;
+  const { x, y } = getPointerPos(e);
+  tapQ.push(x, y);
+});
+
+// ============================
+// Pools (no GC burst on rapid taps)
+// ============================
+const MAX_PARTICLES = IS_MOBILE ? 64 : 220;
+const MAX_FLOATERS  = IS_MOBILE ? 18 : 40;
+
+function initPools() {
+  state.particles.length = 0;
+  for (let i = 0; i < MAX_PARTICLES; i++) {
+    state.particles.push({ alive: false, x:0, y:0, vx:0, vy:0, life:0, t:0 });
+  }
+  state.floaters.length = 0;
+  for (let i = 0; i < MAX_FLOATERS; i++) {
+    state.floaters.push({
+      alive: false,
+      text: "",
+      x0: 0, y0: 0,
+      t: 0, life: 0,
+      rise: 0, wobble: 0,
+      size: 0, weight: 0
+    });
+  }
+}
+
+function allocParticle() {
+  for (let i = 0; i < state.particles.length; i++) {
+    const p = state.particles[i];
+    if (!p.alive) return p;
+  }
+  return null;
+}
+function allocFloater() {
+  for (let i = 0; i < state.floaters.length; i++) {
+    const f = state.floaters[i];
+    if (!f.alive) return f;
+  }
+  return null;
+}
+
 function addFloater(text, x, y, opts = {}) {
-  // mobile: shorter & fewer
   const {
     size = 26,
     life = IS_MOBILE ? 0.55 : 0.7,
@@ -235,20 +294,47 @@ function addFloater(text, x, y, opts = {}) {
     weight = 1000,
   } = opts;
 
-  // keep floater count bounded
-  if (IS_MOBILE && state.floaters.length > 18) return;
+  const ft = allocFloater();
+  if (!ft) return;
 
-  state.floaters.push({
-    text,
-    x0: x,
-    y0: y,
-    t: 0,
-    life,
-    rise,
-    wobble,
-    size,
-    weight,
-  });
+  ft.alive = true;
+  ft.text = text;
+  ft.x0 = x;
+  ft.y0 = y;
+  ft.t = 0;
+  ft.life = life;
+  ft.rise = rise;
+  ft.wobble = wobble;
+  ft.size = size;
+  ft.weight = weight;
+}
+
+function spawnParticles(x, y, n = 18, rapid = false) {
+  const nn = IS_MOBILE ? Math.max(3, Math.floor(n * 0.35)) : n;
+  const outN = rapid ? Math.min(6, nn) : nn;
+
+  for (let i = 0; i < outN; i++) {
+    const p = allocParticle();
+    if (!p) break;
+
+    const a = rand(0, Math.PI * 2);
+    const sp = rapid ? rand(120, 360) : rand(140, 620);
+
+    p.alive = true;
+    p.x = x; p.y = y;
+    p.vx = Math.cos(a) * sp;
+    p.vy = Math.sin(a) * sp;
+    p.life = rapid ? rand(0.14, 0.26) : rand(0.18, 0.42);
+    p.t = 0;
+  }
+}
+
+function pointInFace(px, py) {
+  const dx = px - state.face.x;
+  const dy = py - state.face.y;
+  const pad = IS_MOBILE ? 1.40 : 1.15;
+  const rr = (state.face.r * pad);
+  return (dx * dx + dy * dy) <= (rr * rr);
 }
 
 function startFever(seconds = 7.0) {
@@ -256,7 +342,6 @@ function startFever(seconds = 7.0) {
   state.feverTimer = seconds;
   state.scoreMul = 2;
 
-  // ★FEVER開始はボーナス扱いで hit02 を鳴らす
   playHitBonus();
 
   addFloater("FEVER x2!!", state.face.x, state.face.y - state.face.r - 12, {
@@ -281,79 +366,39 @@ function resetGameForIntro(introSeconds) {
   state.introTotal = introSeconds;
   state.introLeft = introSeconds;
 
-  // ★リセット時に「count再生済み」を戻す
   state.countPlayed = false;
-
-  // ★GO余韻もリセット
   state.goHold = 0;
 
   state.score = 0;
   state.timeLeft = GAME_SECONDS;
 
-  state.particles = [];
-  state.floaters = [];
-  state.shake = 0;
+  initPools();
+  tapQ.clear();
 
+  state.shake = 0;
   state.combo = 0;
   state.comboTimer = 0;
   stopFever();
 
   const { w, h } = getViewportSize();
-
   state.face.r = Math.min(w, h) * 0.10;
   state.face.x = rand(state.face.r, w - state.face.r);
   state.face.y = rand(state.face.r + 90, h - state.face.r);
 
-  // intro後に動き出す速度
   const baseVx = rand(220, 340) * (Math.random() < 0.5 ? -1 : 1);
   const baseVy = rand(180, 300) * (Math.random() < 0.5 ? -1 : 1);
   state.face.baseVx = baseVx;
   state.face.baseVy = baseVy;
 
-  // intro中は不動
   state.face.vx = 0;
   state.face.vy = 0;
 
   state.face.hitTimer = 0;
   state.face.scalePop = 0;
 
-  state.running = false; // reset
   elScore.textContent = "0";
   elTime.textContent = GAME_SECONDS.toFixed(1);
   scoreDirty = false;
-}
-
-// ---- particles: cap + shorter life ----
-const MAX_PARTICLES = IS_MOBILE ? 60 : 220;
-
-function spawnParticles(x, y, n = 18) {
-  if (state.particles.length >= MAX_PARTICLES) return;
-
-  const nn = IS_MOBILE ? Math.max(3, Math.floor(n * 0.35)) : n;
-
-  for (let i = 0; i < nn; i++) {
-    if (state.particles.length >= MAX_PARTICLES) break;
-
-    const a = rand(0, Math.PI * 2);
-    const sp = rand(140, 620);
-    state.particles.push({
-      x, y,
-      vx: Math.cos(a) * sp,
-      vy: Math.sin(a) * sp,
-      life: rand(0.18, 0.42),
-      t: 0
-    });
-  }
-}
-
-function pointInFace(px, py) {
-  const dx = px - state.face.x;
-  const dy = py - state.face.y;
-
-  const pad = IS_MOBILE ? 1.40 : 1.15; // bigger on mobile
-  const rr = (state.face.r * pad);
-
-  return (dx * dx + dy * dy) <= (rr * rr);
 }
 
 function endGame() {
@@ -397,22 +442,14 @@ function startGame() {
 
 btn.addEventListener("click", startGame);
 
-function getPointerPos(e) {
-  const rect = canvas.getBoundingClientRect();
-  const x = (e.clientX - rect.left);
-  const y = (e.clientY - rect.top);
-  return { x, y };
-}
+// ============================
+// Tap processing (max 1 per frame)
+// ============================
+function processOneTap() {
+  const tap = tapQ.pop();
+  if (!tap) return;
 
-canvas.addEventListener("pointerdown", (e) => {
-  if (!state.running) return;
-  if (state.phase !== "play") return; // intro中は無効
-
-  // 1-frame lock: avoid multiple heavy work in same frame
-  if (hitLock) return;
-  hitLock = true;
-
-  const { x, y } = getPointerPos(e);
+  const { x, y } = tap;
 
   if (pointInFace(x, y)) {
     const rapid = isRapidHit();
@@ -427,19 +464,18 @@ canvas.addEventListener("pointerdown", (e) => {
     state.score += add;
     markScoreDirty();
 
-    // floaters (reduce on rapid taps)
+    // floaters: strong throttle on rapid
     if (!rapid) {
       addFloater(`+${add}`, state.face.x, state.face.y - state.face.r * 0.15, {
         size: IS_MOBILE ? 26 : 30, life: 0.65, rise: 130, wobble: 10, weight: 1200
       });
-    } else {
-      // very light (shorter)
+    } else if ((state.combo % 3) === 0) { // rapid: 3回に1回だけ
       addFloater(`+${add}`, state.face.x, state.face.y - state.face.r * 0.10, {
-        size: IS_MOBILE ? 22 : 26, life: 0.40, rise: 80, wobble: 6, weight: 1100
+        size: IS_MOBILE ? 22 : 26, life: 0.40, rise: 70, wobble: 6, weight: 1100
       });
     }
 
-    // desktop only onomatopoeia (heavy text + stroke)
+    // desktop only extra text (and not rapid)
     if (!IS_MOBILE && !rapid) {
       const words = ["SPLASH!!", "BOON!!", "ﾍﾞﾁｬ!!"];
       const w = words[(Math.random() * words.length) | 0];
@@ -455,10 +491,10 @@ canvas.addEventListener("pointerdown", (e) => {
       });
     }
 
-    // ★通常ヒット音
+    // sound
     playHitNormal();
 
-    // 5連続ボーナス
+    // 5 combo bonus
     if (state.combo === 5) {
       const bonus = 10 * state.scoreMul;
       state.score += bonus;
@@ -469,14 +505,11 @@ canvas.addEventListener("pointerdown", (e) => {
           size: IS_MOBILE ? 36 : 44, life: 1.00, rise: 160, wobble: 22, weight: 1300
         });
       }
-
-      // ★ボーナスヒット音
       playHitBonus();
-
       state.shake = Math.max(state.shake, IS_MOBILE ? 0.28 : 0.35);
     }
 
-    // 10連続でFEVER開始（startFever内でhit02鳴る）
+    // 10 combo fever
     if (state.combo === 10 && !state.fever) {
       startFever(3.0);
     }
@@ -489,11 +522,10 @@ canvas.addEventListener("pointerdown", (e) => {
       (state.fever ? (IS_MOBILE ? 0.18 : 0.22) : (IS_MOBILE ? 0.15 : 0.18)) + Math.min(0.22, state.combo * 0.012)
     );
 
-    // particles (reduce on rapid taps)
-    if (!rapid) spawnParticles(state.face.x, state.face.y, 26);
-    else spawnParticles(state.face.x, state.face.y, 8);
+    // particles (rapid: fewer)
+    spawnParticles(state.face.x, state.face.y, 26, rapid);
 
-    // speed growth: lower
+    // speed growth: lower on rapid
     const mult = rapid ? rand(0.995, 1.02) : rand(0.97, 1.05);
     state.face.vx *= mult;
     state.face.vy *= mult;
@@ -507,34 +539,33 @@ canvas.addEventListener("pointerdown", (e) => {
     state.combo = 0;
     state.timeLeft = Math.max(0, state.timeLeft - 0.25);
   }
-});
+}
 
 function update(dt) {
-  // intro phase
+  // intro
   if (state.phase === "intro") {
-
-    // GO余韻中なら、GOを固定表示して待つ
     if (state.goHold > 0) {
       state.goHold = Math.max(0, state.goHold - dt);
       elTime.textContent = GAME_SECONDS.toFixed(1);
 
       // update floaters
-      state.floaters = state.floaters.filter(ft => {
+      for (const ft of state.floaters) {
+        if (!ft.alive) continue;
         ft.t += dt;
-        return ft.t < ft.life;
-      });
+        if (ft.t >= ft.life) ft.alive = false;
+      }
 
       // update particles
-      state.particles = state.particles.filter(p => {
+      for (const p of state.particles) {
+        if (!p.alive) continue;
         p.t += dt;
         p.x += p.vx * dt;
         p.y += p.vy * dt;
         p.vx *= Math.pow(0.06, dt);
         p.vy *= Math.pow(0.06, dt);
-        return p.t < p.life;
-      });
+        if (p.t >= p.life) p.alive = false;
+      }
 
-      // 余韻終了で play 開始
       if (state.goHold <= 0) {
         state.phase = "play";
         state.timeLeft = GAME_SECONDS;
@@ -546,49 +577,44 @@ function update(dt) {
       return;
     }
 
-    // 通常カウントダウン
     state.introLeft = Math.max(0, state.introLeft - dt);
     elTime.textContent = GAME_SECONDS.toFixed(1);
 
-    // ★3秒前になったら count.mp3 を1回だけ再生
     if (!state.countPlayed && state.introLeft <= 3.0) {
       playCount();
       state.countPlayed = true;
     }
 
-    // update floaters
-    state.floaters = state.floaters.filter(ft => {
+    for (const ft of state.floaters) {
+      if (!ft.alive) continue;
       ft.t += dt;
-      return ft.t < ft.life;
-    });
+      if (ft.t >= ft.life) ft.alive = false;
+    }
 
-    // update particles
-    state.particles = state.particles.filter(p => {
+    for (const p of state.particles) {
+      if (!p.alive) continue;
       p.t += dt;
       p.x += p.vx * dt;
       p.y += p.vy * dt;
       p.vx *= Math.pow(0.06, dt);
       p.vy *= Math.pow(0.06, dt);
-      return p.t < p.life;
-    });
+      if (p.t >= p.life) p.alive = false;
+    }
 
-    // intro finished -> show GO and hold
     if (state.introLeft <= 0) {
       state.goHold = GO_HOLD_SECONDS;
       elTime.textContent = GAME_SECONDS.toFixed(1);
 
-      // GOフローター（表示時間はGO_HOLD_SECONDSに合わせる）
       addFloater("GO!!", state.face.x, state.face.y - state.face.r - 10, {
         size: IS_MOBILE ? 46 : 52, life: GO_HOLD_SECONDS, rise: 140, wobble: 16, weight: 1300
       });
 
       state.shake = Math.max(state.shake, IS_MOBILE ? 0.18 : 0.22);
     }
-
     return;
   }
 
-  // play phase
+  // play
   state.timeLeft -= dt;
   if (state.timeLeft <= 0) {
     state.timeLeft = 0;
@@ -598,12 +624,14 @@ function update(dt) {
   }
   elTime.textContent = state.timeLeft.toFixed(1);
 
+  // process at most 1 tap per frame
+  processOneTap();
+
   const f = state.face;
   f.x += f.vx * dt;
   f.y += f.vy * dt;
 
   const { w, h } = getViewportSize();
-
   const topMargin = 56;
   if (f.x - f.r < 0) { f.x = f.r; f.vx *= -1; }
   if (f.x + f.r > w) { f.x = w - f.r; f.vx *= -1; }
@@ -614,19 +642,21 @@ function update(dt) {
   f.scalePop = Math.max(0, f.scalePop - dt);
   state.shake = Math.max(0, state.shake - dt);
 
-  state.particles = state.particles.filter(p => {
+  for (const p of state.particles) {
+    if (!p.alive) continue;
     p.t += dt;
     p.x += p.vx * dt;
     p.y += p.vy * dt;
     p.vx *= Math.pow(0.06, dt);
     p.vy *= Math.pow(0.06, dt);
-    return p.t < p.life;
-  });
+    if (p.t >= p.life) p.alive = false;
+  }
 
-  state.floaters = state.floaters.filter(ft => {
+  for (const ft of state.floaters) {
+    if (!ft.alive) continue;
     ft.t += dt;
-    return ft.t < ft.life;
-  });
+    if (ft.t >= ft.life) ft.alive = false;
+  }
 
   if (state.comboTimer > 0) {
     state.comboTimer = Math.max(0, state.comboTimer - dt);
@@ -641,19 +671,12 @@ function update(dt) {
 
 function drawIntroCountdown() {
   const { w, h } = getViewportSize();
-
   const left = state.introLeft;
 
-  // ---- 最初の2秒(7→5)は数字を表示しない ----
   const waiting = (left > 5.0);
-
-  // 表示用カウント：5..0 にする（7秒スタート想定）
   const n = Math.max(0, Math.min(5, Math.ceil(left)));
-
-  // GO表示：最後の1秒はGO（0の二重表示を防ぐ）
   const isGo = (left <= 0.0);
 
-  // パルス（見た目用）
   const p = (state.introTotal > 0) ? (left / state.introTotal) : 0;
   const pulse = 1 + 0.08 * Math.sin((1 - p) * Math.PI * 6);
 
@@ -662,34 +685,26 @@ function drawIntroCountdown() {
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
 
-  // 上の "GET READY" は常に出す
   ctx.font = `900 24px system-ui, sans-serif`;
-
   if (!IS_MOBILE) {
     ctx.lineWidth = 8;
-    ctx.strokeStyle = "rgba(0,0,0,0.65)";
+    ctx.strokeStyle = "rgba(0,0,0,0.18)";
     ctx.strokeText("GET READY", w / 2, h / 2 - 110);
   }
-  ctx.fillStyle = "rgba(20,20,20,0.92)";
+  ctx.fillStyle = "rgba(30,30,30,0.90)";
   ctx.fillText("GET READY", w / 2, h / 2 - 110);
 
-  // 待機中(最初の2秒)は数字を描かずに終了
-  if (waiting) {
-    ctx.restore();
-    return;
-  }
+  if (waiting) { ctx.restore(); return; }
 
-  // 5..0, GO!
   const text = isGo ? "GO!" : String(n);
 
   ctx.font = `${Math.floor((IS_MOBILE ? 100 : 120) * pulse)}px system-ui, sans-serif`;
-
   if (!IS_MOBILE) {
     ctx.lineWidth = 14;
-    ctx.strokeStyle = "rgba(0,0,0,0.65)";
+    ctx.strokeStyle = "rgba(0,0,0,0.18)";
     ctx.strokeText(text, w / 2, h / 2);
   }
-  ctx.fillStyle = "rgba(20,20,20,0.92)";
+  ctx.fillStyle = "rgba(30,30,30,0.90)";
   ctx.fillText(text, w / 2, h / 2);
 
   ctx.restore();
@@ -715,20 +730,23 @@ function draw() {
   ctx.fillStyle = "#e9edf2";
   ctx.fillRect(0, 0, w, h);
 
-  // ---- particles: sprite draw (fast) ----
+  // ---- particles: sprite draw ----
   if (dotSprite) {
     for (const p of state.particles) {
+      if (!p.alive) continue;
       const a = 1 - (p.t / p.life);
       ctx.globalAlpha = a;
 
-      const r = (IS_MOBILE ? 7 : 9) * a + 2; // 2..11
+      const r = (IS_MOBILE ? 7 : 9) * a + 2;
       ctx.drawImage(dotSprite, p.x - r, p.y - r, r * 2, r * 2);
     }
     ctx.globalAlpha = 1;
   }
 
-  // ---- floaters (skip strokeText on mobile) ----
+  // ---- floaters (mobile: no stroke) ----
   for (const ft of state.floaters) {
+    if (!ft.alive) continue;
+
     const p = ft.t / ft.life;
     const ease = 1 - Math.pow(1 - p, 3);
     const yy = ft.y0 - ft.rise * ease;
@@ -742,11 +760,11 @@ function draw() {
 
     if (!IS_MOBILE) {
       ctx.lineWidth = 8;
-      ctx.strokeStyle = "rgba(0,0,0,0.28)";
+      ctx.strokeStyle = "rgba(0,0,0,0.18)";
       ctx.strokeText(ft.text, xx, yy);
     }
 
-    ctx.fillStyle = "rgba(20,20,20,0.92)";
+    ctx.fillStyle = "rgba(30,30,30,0.90)";
     ctx.fillText(ft.text, xx, yy);
   }
   ctx.globalAlpha = 1;
@@ -758,14 +776,14 @@ function draw() {
   const size = (f.r * 2) * pop;
 
   // shadow
-  ctx.globalAlpha = 0.18;
+  ctx.globalAlpha = 0.12;
   ctx.beginPath();
   ctx.ellipse(f.x, f.y + f.r * 0.78, f.r * 0.95, f.r * 0.35, 0, 0, Math.PI * 2);
   ctx.fillStyle = "#000000";
   ctx.fill();
   ctx.globalAlpha = 1;
 
-  // face circle clipped image
+  // face
   ctx.save();
   ctx.beginPath();
   ctx.arc(f.x, f.y, (f.r * pop), 0, Math.PI * 2);
@@ -773,7 +791,6 @@ function draw() {
   ctx.drawImage(img, f.x - size / 2, f.y - size / 2, size, size);
   ctx.restore();
 
-  // rim
   ctx.lineWidth = 4;
   ctx.strokeStyle = "rgba(0,0,0,0.10)";
   ctx.beginPath();
@@ -786,7 +803,7 @@ function draw() {
 
   ctx.restore();
 
-  // ---- HUD ----
+  // HUD
   ctx.save();
   ctx.globalAlpha = 0.95;
   ctx.textAlign = "right";
@@ -802,20 +819,17 @@ function draw() {
 
   function drawHudText(text, x, y, font) {
     ctx.font = font;
-
     if (!IS_MOBILE) {
       ctx.lineWidth = 6;
-      ctx.strokeStyle = "rgba(0,0,0,0.25)";
+      ctx.strokeStyle = "rgba(0,0,0,0.18)";
       ctx.strokeText(text, x, y);
     }
-    ctx.fillStyle = "rgba(20,20,20,0.92)";
+    ctx.fillStyle = "rgba(30,30,30,0.90)";
     ctx.fillText(text, x, y);
   }
 
   if (state.phase === "play") {
-    if (state.combo >= 2) {
-      drawHudText(`COMBO: ${state.combo}`, hudX, hudY, comboFont);
-    }
+    if (state.combo >= 2) drawHudText(`COMBO: ${state.combo}`, hudX, hudY, comboFont);
     if (state.fever) {
       const t = Math.max(0, state.feverTimer).toFixed(1);
       drawHudText(`FEVER x2  ${t}s`, hudX, hudY + lineH, feverFont);
@@ -824,7 +838,7 @@ function draw() {
 
   ctx.restore();
 
-  // ---- DOM update once per frame ----
+  // DOM update once per frame
   if (scoreDirty) {
     elScore.textContent = String(state.score);
     scoreDirty = false;
@@ -833,18 +847,12 @@ function draw() {
 
 function loop(t) {
   if (!state.running) return;
-
   const dt = clamp((t - state.lastT) / 1000, 0, 0.033);
   state.lastT = t;
 
   update(dt);
-
   if (state.running) {
     draw();
-
-    // unlock hit once per frame
-    hitLock = false;
-
     requestAnimationFrame(loop);
   }
 }

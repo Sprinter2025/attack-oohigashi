@@ -10,6 +10,10 @@
 //   - comboが10の倍数ごとに +5pt（フィーバー中はx2）
 //   - comboが50達成ごとにFEVER突入（50,100,150...で再突入=タイマ更新）
 // - Variable particles: combo / feverで粒子数を増やす
+// - FEVER演出：
+//   - 画面オーバーレイ（脈動）
+//   - FEVER突入フラッシュ + リング
+//   - 敵画像を虹色（hue-rotate）で変色（主にFEVER中）
 
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d", { alpha: false });
@@ -88,7 +92,6 @@ let gainSe = null;
 let buffers = { hit01: null, hit02: null, count: null, bgm: null };
 let bgmSource = null;
 
-// ★ロード多重実行防止 & START中ガード
 let audioReadyPromise = null;
 let isStarting = false;
 
@@ -106,36 +109,29 @@ function audioIsReady() {
   return !!(audioCtx && buffers.hit01 && buffers.hit02 && buffers.count && buffers.bgm);
 }
 
-// ★失敗しても復帰できるensureAudio
 async function ensureAudio() {
   if (audioIsReady()) return;
-
   if (audioReadyPromise) return audioReadyPromise;
 
   audioReadyPromise = (async () => {
     try {
-      // 途中で壊れてたら作り直す
-      if (audioCtx) {
-        try { audioCtx.close(); } catch (_) {}
-      }
+      if (audioCtx) { try { audioCtx.close(); } catch (_) {} }
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
       gainBgm = audioCtx.createGain();
       gainSe = audioCtx.createGain();
-      gainBgm.gain.value = 0.18; // bgm volume
-      gainSe.gain.value = 0.85;  // se volume
+      gainBgm.gain.value = 0.18;
+      gainSe.gain.value = 0.85;
       gainBgm.connect(audioCtx.destination);
       gainSe.connect(audioCtx.destination);
 
       async function loadBuf(url) {
         const res = await fetch(url, { cache: "no-store" });
-        if (!res.ok) {
-          throw new Error(`fetch failed ${res.status}: ${url}`);
-        }
+        if (!res.ok) throw new Error(`fetch failed ${res.status}: ${url}`);
         const arr = await res.arrayBuffer();
         try {
           return await audioCtx.decodeAudioData(arr);
-        } catch (e) {
+        } catch (_) {
           throw new Error(`decodeAudioData failed: ${url}`);
         }
       }
@@ -153,11 +149,8 @@ async function ensureAudio() {
       buffers.bgm = b4;
 
     } catch (e) {
-      // ★重要：失敗したら次回やり直せるように戻す
       audioReadyPromise = null;
-      if (audioCtx) {
-        try { audioCtx.close(); } catch (_) {}
-      }
+      if (audioCtx) { try { audioCtx.close(); } catch (_) {} }
       audioCtx = null;
       gainBgm = null;
       gainSe = null;
@@ -185,7 +178,7 @@ function playSE(buf, volMul = 1.0) {
   if (!audioCtx || !buf) return;
 
   const now = performance.now();
-  if (IS_MOBILE && now - lastSeTime < 70) return; // throttle
+  if (IS_MOBILE && now - lastSeTime < 70) return;
   lastSeTime = now;
 
   const src = audioCtx.createBufferSource();
@@ -203,6 +196,65 @@ function playHitNormal() { playSE(buffers.hit01, 0.95); }
 function playHitBonus()  { playSE(buffers.hit02, 1.00); }
 function playCount()     { playSE(buffers.count, 0.95); }
 
+// ---- result packs (from result_data.js) ----
+function pickResultPack(score) {
+  const packs = window.RESULT_PACKS;
+  if (!Array.isArray(packs) || packs.length === 0) return null;
+
+  for (let i = 0; i < packs.length; i++) {
+    const p = packs[i];
+    const minOk = (score >= (p.min ?? -Infinity));
+    const maxOk = (p.max == null) ? true : (score <= p.max);
+    if (minOk && maxOk) return p;
+  }
+  return packs[packs.length - 1] || null;
+}
+
+function pickRandom(arr) {
+  if (!Array.isArray(arr) || arr.length === 0) return "";
+  return arr[(Math.random() * arr.length) | 0];
+}
+
+function renderResultWithPack(score) {
+  const pack = pickResultPack(score);
+
+  // 既存表示をクリア
+  resultEl.textContent = "";
+
+  const wrap = document.createElement("div");
+  wrap.style.display = "grid";
+  wrap.style.gap = "10px";
+  wrap.style.justifyItems = "center";
+
+  if (pack && pack.img) {
+    const img = document.createElement("img");
+    img.src = pack.img;
+    img.alt = "result";
+    img.style.width = "min(72vw, 360px)";
+    img.style.height = "auto";
+    img.style.borderRadius = "14px";
+    img.style.boxShadow = "0 10px 30px rgba(0,0,0,0.35)";
+    img.loading = "eager";
+    wrap.appendChild(img);
+  }
+
+  const comment = document.createElement("div");
+  comment.textContent = pack ? pickRandom(pack.comments) : "";
+  comment.style.fontWeight = "800";
+  comment.style.fontSize = "18px";
+  comment.style.textAlign = "center";
+  comment.style.lineHeight = "1.3";
+  wrap.appendChild(comment);
+
+  const scoreLine = document.createElement("div");
+  scoreLine.textContent = `Score: ${score} / Best: ${best}`;
+  scoreLine.style.opacity = "0.95";
+  scoreLine.style.fontWeight = "700";
+  wrap.appendChild(scoreLine);
+
+  resultEl.appendChild(wrap);
+}
+
 // ---- best ----
 let best = Number(localStorage.getItem(BEST_KEY) || 0);
 elBest.textContent = best.toString();
@@ -214,10 +266,10 @@ const GO_HOLD_SECONDS = 1.0;
 const GAME_SECONDS = 30.0;
 
 // ---- combo/fever spec ----
-const COMBO_BONUS_EVERY = 10;  // 10の倍数ごと
-const COMBO_BONUS_PTS = 5;     // +5pt
-const FEVER_EVERY = 50;        // 50達成ごと
-const FEVER_SECONDS = 7.0;     // fever持続（好きに調整OK）
+const COMBO_BONUS_EVERY = 10;
+const COMBO_BONUS_PTS = 5;
+const FEVER_EVERY = 50;
+const FEVER_SECONDS = 7.0;
 
 // 速度の上限（暴走防止）
 function speedLimit() {
@@ -251,6 +303,11 @@ const state = {
   fever: false,
   feverTimer: 0,
   scoreMul: 1,
+
+  // ★FEVER演出用
+  feverFlash: 0,   // 秒：突入フラッシュ
+  feverBurst: 0,   // 0..1：リングなど
+  hueTime: 0,      // 虹色変色の位相
 
   face: {
     x: 120,
@@ -296,8 +353,12 @@ function addFloater(text, x, y, opts = {}) {
 
 function startFever(seconds = FEVER_SECONDS) {
   state.fever = true;
-  state.feverTimer = seconds;  // ★再突入でタイマ更新
+  state.feverTimer = seconds;   // 再突入で更新
   state.scoreMul = 2;
+
+  // ★突入演出
+  state.feverFlash = 0.18;
+  state.feverBurst = 1.0;
 
   playHitBonus();
 
@@ -336,6 +397,10 @@ function resetGameForIntro(introSeconds) {
   state.combo = 0;
   state.comboTimer = 0;
   stopFever();
+
+  state.feverFlash = 0;
+  state.feverBurst = 0;
+  state.hueTime = 0;
 
   const { w, h } = getViewportSize();
 
@@ -402,11 +467,10 @@ function endGame() {
   } else {
     titleEl.textContent = "RESULT";
   }
-  resultEl.textContent = `Score: ${state.score} / Best: ${best}`;
+  renderResultWithPack(state.score);
   btn.textContent = "RETRY";
 }
 
-// ★音声ロード(decode)完了までゲーム開始しない + 二重起動防止 + LOADING表示
 async function startGame() {
   if (isStarting) return;
   isStarting = true;
@@ -460,19 +524,10 @@ function getPointerPos(e) {
 }
 
 function particleCountForHit() {
-  // 基本
   let n = 18;
-
-  // comboが伸びるほど少し増える（上限つき）
-  // 例：combo 0→18, 10→24, 30→30, 50→34
   n = clamp(18 + state.combo * 0.6, 18, 34);
-
-  // FEVER中はさらに増える
   if (state.fever) n = Math.floor(n * 1.6);
-
-  // 10の倍数ヒットは気持ち追加
   if (state.combo > 0 && (state.combo % COMBO_BONUS_EVERY === 0)) n += 10;
-
   return n;
 }
 
@@ -483,12 +538,10 @@ canvas.addEventListener("pointerdown", (e) => {
   const { x, y } = getPointerPos(e);
 
   if (pointInFace(x, y)) {
-    // combo更新
     if (state.comboTimer > 0) state.combo += 1;
     else state.combo = 1;
     state.comboTimer = state.comboWindow;
 
-    // 基本加点
     const add = 1 * state.scoreMul;
     state.score += add;
 
@@ -498,7 +551,6 @@ canvas.addEventListener("pointerdown", (e) => {
 
     playHitNormal();
 
-    // ★10の倍数ごとに +5pt（フィーバー中はx2）
     if (state.combo % COMBO_BONUS_EVERY === 0) {
       const bonus = COMBO_BONUS_PTS * state.scoreMul;
       state.score += bonus;
@@ -511,7 +563,6 @@ canvas.addEventListener("pointerdown", (e) => {
       state.shake = Math.max(state.shake, IS_MOBILE ? 0.26 : 0.33);
     }
 
-    // ★50combo達成ごとにFEVER突入（50,100,150...）
     if (state.combo % FEVER_EVERY === 0) {
       startFever(FEVER_SECONDS);
     }
@@ -526,7 +577,6 @@ canvas.addEventListener("pointerdown", (e) => {
       (state.fever ? (IS_MOBILE ? 0.16 : 0.20) : (IS_MOBILE ? 0.13 : 0.16)) + Math.min(0.22, state.combo * 0.012)
     );
 
-    // ★可変粒子（combo/feverで増える）
     spawnParticles(state.face.x, state.face.y, particleCountForHit());
 
     const mult = rand(0.97, 1.05);
@@ -577,6 +627,13 @@ function updateFloaters(dt) {
 }
 
 function update(dt) {
+  // 虹色位相（常に回してOK。軽い）
+  state.hueTime += dt;
+
+  // 突入フラッシュ/リング減衰
+  if (state.feverFlash > 0) state.feverFlash = Math.max(0, state.feverFlash - dt);
+  if (state.feverBurst > 0) state.feverBurst = Math.max(0, state.feverBurst - dt * 2.6);
+
   if (state.phase === "intro") {
     if (state.goHold > 0) {
       state.goHold = Math.max(0, state.goHold - dt);
@@ -716,6 +773,16 @@ function draw() {
   ctx.fillStyle = BG_COLOR;
   ctx.fillRect(0, 0, w, h);
 
+  // ---- FEVER overlay (脈動) ----
+  if (state.fever) {
+    // うっすら色を被せる（重くならない）
+    const pulse = 0.06 + 0.03 * Math.sin(state.hueTime * 6.0);
+    ctx.globalAlpha = pulse;
+    ctx.fillStyle = "rgba(180,220,255,1)"; // 青白
+    ctx.fillRect(0, 0, w, h);
+    ctx.globalAlpha = 1;
+  }
+
   // particles
   if (dotSprite) {
     for (let i = 0; i < state.particles.length; i++) {
@@ -765,11 +832,28 @@ function draw() {
   ctx.fill();
   ctx.globalAlpha = 1;
 
+  // ★虹色変色：FEVER中は強め、通常時は弱め（好みで通常時0にしてもOK）
+  // 端末によって ctx.filter 非対応の場合があるが、非対応なら無視されて普通に描画される
+  const hueDeg = (state.hueTime * 220 + (f.x + f.y) * 0.15) % 360;
+  const hueStrength = state.fever ? 1.0 : 0.0; // 通常時も少し変えたいなら0.25、完全OFFなら0.0
+
   ctx.save();
   ctx.beginPath();
   ctx.arc(f.x, f.y, (f.r * pop), 0, Math.PI * 2);
   ctx.clip();
+
+  if (hueStrength > 0) {
+    // 強さは "saturate/contrast" で調整（軽い）
+    const sat = state.fever ? 2.2 : 1.2;
+    const con = state.fever ? 1.12 : 1.02;
+    ctx.filter = `hue-rotate(${hueDeg}deg) saturate(${sat}) contrast(${con})`;
+  } else {
+    ctx.filter = "none";
+  }
+
   ctx.drawImage(img, f.x - size / 2, f.y - size / 2, size, size);
+
+  ctx.filter = "none";
   ctx.restore();
 
   ctx.lineWidth = 4;
@@ -780,6 +864,34 @@ function draw() {
 
   if (state.phase === "intro") {
     drawIntroCountdown();
+  }
+
+  // ---- FEVER enter flash + ring (cheap) ----
+  if (state.feverFlash > 0 || state.feverBurst > 0) {
+    const aFlash = Math.min(1, state.feverFlash / 0.18);
+    if (aFlash > 0) {
+      ctx.save();
+      ctx.globalAlpha = 0.28 * aFlash;
+      ctx.fillStyle = "rgba(255,255,255,1)";
+      ctx.fillRect(0, 0, w, h);
+      ctx.restore();
+    }
+
+    const b = state.feverBurst; // 0..1
+    if (b > 0) {
+      const cx = f.x, cy = f.y;
+      const r0 = f.r * 0.8;
+      const r1 = r0 + (1 - b) * (Math.min(w, h) * 0.55);
+
+      ctx.save();
+      ctx.globalAlpha = 0.55 * b;
+      ctx.lineWidth = 6;
+      ctx.strokeStyle = "rgba(255,255,255,0.9)";
+      ctx.beginPath();
+      ctx.arc(cx, cy, r1, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
   }
 
   ctx.restore();

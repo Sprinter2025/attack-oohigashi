@@ -4,6 +4,12 @@
 // - Performance: cap DPR to 2, reduce particles/floaters, thinner strokes on mobile
 // - Particles: use pre-rendered sprite + MAX_PARTICLES cap (fast)
 // - Sounds: throttle SE on mobile (avoid audio spam stutter)
+// - FIX: heavy on rapid hits ->
+//   * 1-frame hit lock
+//   * DOM score update only once per frame (dirty flag)
+//   * reduce particles/floaters on rapid hits
+//   * skip strokeText on mobile (floaters/HUD)
+// - Background: pale gray
 
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
@@ -87,34 +93,52 @@ function safeAudio(src, loop = false, volume = 0.6) {
   return a;
 }
 
+// ---- audio pool (better for rapid taps on mobile) ----
+function makeAudioPool(src, size = 6, volume = 0.7) {
+  const list = [];
+  for (let i = 0; i < size; i++) {
+    const a = new Audio(src);
+    a.loop = false;
+    a.volume = volume;
+    a.preload = "auto";
+    list.push(a);
+  }
+  return { list, i: 0 };
+}
+
 function initAudio() {
-  // BGM: ちょい控えめ（好みで調整OK）
+  // BGM
   if (!assets.bgm) assets.bgm = safeAudio("./assets/bgm.mp3", true, 0.18);
 
-  // SE
-  if (!assets.hit01) assets.hit01 = safeAudio("./assets/hit01.mp3", false, 0.75);
-  if (!assets.hit02) assets.hit02 = safeAudio("./assets/hit02.mp3", false, 0.85);
+  // SE (pool)
+  if (!assets.hit01) assets.hit01 = makeAudioPool("./assets/hit01.mp3", IS_MOBILE ? 4 : 8, 0.75);
+  if (!assets.hit02) assets.hit02 = makeAudioPool("./assets/hit02.mp3", IS_MOBILE ? 3 : 6, 0.85);
 
-  // Countdown
-  if (!assets.count) assets.count = safeAudio("./assets/count.mp3", false, 0.75);
+  // Countdown (pool small)
+  if (!assets.count) assets.count = makeAudioPool("./assets/count.mp3", 2, 0.75);
 }
 
 // ---- audio throttle (mobile) ----
 let lastSeTime = 0;
-function playAudio(a) {
-  if (!a) return;
+function playPool(pool) {
+  if (!pool) return;
 
   const now = performance.now();
   if (IS_MOBILE && now - lastSeTime < 80) return; // drop too-frequent SE
   lastSeTime = now;
 
-  a.currentTime = 0;
+  const a = pool.list[pool.i];
+  pool.i = (pool.i + 1) % pool.list.length;
+
+  // try reset but tolerate failures on some browsers
+  try { a.pause(); } catch {}
+  try { a.currentTime = 0; } catch {}
   a.play().catch(() => {});
 }
 
-function playHitNormal() { playAudio(assets.hit01); }
-function playHitBonus()  { playAudio(assets.hit02); }
-function playCount()     { playAudio(assets.count); }
+function playHitNormal() { playPool(assets.hit01); }
+function playHitBonus()  { playPool(assets.hit02); }
+function playCount()     { playPool(assets.count); }
 
 function startBGM() {
   if (!assets.bgm) return;
@@ -185,6 +209,22 @@ const state = {
 
 let hasStartedOnce = false; // ★初回/リトライ判定
 
+// ---- DOM update throttle (score) ----
+let scoreDirty = true;
+function markScoreDirty() { scoreDirty = true; }
+
+// ---- 1-frame hit lock (prevent multi-hit in same frame) ----
+let hitLock = false;
+
+// ---- rapid hit detector: reduce effects only when spam tapping ----
+let lastHitPerf = 0;
+function isRapidHit() {
+  const now = performance.now();
+  const rapid = (now - lastHitPerf) < 70; // <70ms = spam taps
+  lastHitPerf = now;
+  return rapid;
+}
+
 function addFloater(text, x, y, opts = {}) {
   // mobile: shorter & fewer
   const {
@@ -195,7 +235,7 @@ function addFloater(text, x, y, opts = {}) {
     weight = 1000,
   } = opts;
 
-  // mobile: keep floater count bounded
+  // keep floater count bounded
   if (IS_MOBILE && state.floaters.length > 18) return;
 
   state.floaters.push({
@@ -277,8 +317,10 @@ function resetGameForIntro(introSeconds) {
   state.face.hitTimer = 0;
   state.face.scalePop = 0;
 
+  state.running = false; // reset
   elScore.textContent = "0";
   elTime.textContent = GAME_SECONDS.toFixed(1);
+  scoreDirty = false;
 }
 
 // ---- particles: cap + shorter life ----
@@ -287,7 +329,7 @@ const MAX_PARTICLES = IS_MOBILE ? 60 : 220;
 function spawnParticles(x, y, n = 18) {
   if (state.particles.length >= MAX_PARTICLES) return;
 
-  const nn = IS_MOBILE ? Math.max(4, Math.floor(n * 0.35)) : n;
+  const nn = IS_MOBILE ? Math.max(3, Math.floor(n * 0.35)) : n;
 
   for (let i = 0; i < nn; i++) {
     if (state.particles.length >= MAX_PARTICLES) break;
@@ -366,9 +408,15 @@ canvas.addEventListener("pointerdown", (e) => {
   if (!state.running) return;
   if (state.phase !== "play") return; // intro中は無効
 
+  // 1-frame lock: avoid multiple heavy work in same frame
+  if (hitLock) return;
+  hitLock = true;
+
   const { x, y } = getPointerPos(e);
 
   if (pointInFace(x, y)) {
+    const rapid = isRapidHit();
+
     // combo
     if (state.comboTimer > 0) state.combo += 1;
     else state.combo = 1;
@@ -377,14 +425,22 @@ canvas.addEventListener("pointerdown", (e) => {
     // score
     const add = 1 * state.scoreMul;
     state.score += add;
-    elScore.textContent = String(state.score);
+    markScoreDirty();
 
-    addFloater(`+${add}`, state.face.x, state.face.y - state.face.r * 0.15, {
-      size: IS_MOBILE ? 26 : 30, life: 0.65, rise: 130, wobble: 10, weight: 1200
-    });
+    // floaters (reduce on rapid taps)
+    if (!rapid) {
+      addFloater(`+${add}`, state.face.x, state.face.y - state.face.r * 0.15, {
+        size: IS_MOBILE ? 26 : 30, life: 0.65, rise: 130, wobble: 10, weight: 1200
+      });
+    } else {
+      // very light (shorter)
+      addFloater(`+${add}`, state.face.x, state.face.y - state.face.r * 0.10, {
+        size: IS_MOBILE ? 22 : 26, life: 0.40, rise: 80, wobble: 6, weight: 1100
+      });
+    }
 
-    // mobile: remove random onomatopoeia floater (heavy text + stroke)
-    if (!IS_MOBILE) {
+    // desktop only onomatopoeia (heavy text + stroke)
+    if (!IS_MOBILE && !rapid) {
       const words = ["SPLASH!!", "BOON!!", "ﾍﾞﾁｬ!!"];
       const w = words[(Math.random() * words.length) | 0];
       addFloater(w, state.face.x, state.face.y - state.face.r - 10, {
@@ -392,25 +448,27 @@ canvas.addEventListener("pointerdown", (e) => {
       });
     }
 
-    if (state.combo >= 3 && !IS_MOBILE) {
+    if (state.combo >= 3 && !IS_MOBILE && !rapid) {
       addFloater(`${state.combo} COMBO!!`, state.face.x, state.face.y + state.face.r + 8, {
         size: 30 + Math.min(20, state.combo * 2),
         life: 0.60, rise: 70, wobble: 12, weight: 1200
       });
     }
 
-    // ★通常ヒット音（まず鳴らす）
+    // ★通常ヒット音
     playHitNormal();
 
     // 5連続ボーナス
     if (state.combo === 5) {
       const bonus = 10 * state.scoreMul;
       state.score += bonus;
-      elScore.textContent = String(state.score);
+      markScoreDirty();
 
-      addFloater(`+${bonus} BONUS!!`, state.face.x, state.face.y, {
-        size: IS_MOBILE ? 36 : 44, life: 1.00, rise: 160, wobble: 22, weight: 1300
-      });
+      if (!rapid) {
+        addFloater(`+${bonus} BONUS!!`, state.face.x, state.face.y, {
+          size: IS_MOBILE ? 36 : 44, life: 1.00, rise: 160, wobble: 22, weight: 1300
+        });
+      }
 
       // ★ボーナスヒット音
       playHitBonus();
@@ -431,10 +489,12 @@ canvas.addEventListener("pointerdown", (e) => {
       (state.fever ? (IS_MOBILE ? 0.18 : 0.22) : (IS_MOBILE ? 0.15 : 0.18)) + Math.min(0.22, state.combo * 0.012)
     );
 
-    spawnParticles(state.face.x, state.face.y, 26);
+    // particles (reduce on rapid taps)
+    if (!rapid) spawnParticles(state.face.x, state.face.y, 26);
+    else spawnParticles(state.face.x, state.face.y, 8);
 
     // speed growth: lower
-    const mult = rand(0.97, 1.05);
+    const mult = rapid ? rand(0.995, 1.02) : rand(0.97, 1.05);
     state.face.vx *= mult;
     state.face.vy *= mult;
 
@@ -584,11 +644,10 @@ function drawIntroCountdown() {
 
   const left = state.introLeft;
 
-  // ---- ここが肝：最初の2秒(7→5)は数字を表示しない ----
+  // ---- 最初の2秒(7→5)は数字を表示しない ----
   const waiting = (left > 5.0);
 
   // 表示用カウント：5..0 にする（7秒スタート想定）
-  // left=5 → 5, left=4 → 4, ... left=0 → 0
   const n = Math.max(0, Math.min(5, Math.ceil(left)));
 
   // GO表示：最後の1秒はGO（0の二重表示を防ぐ）
@@ -605,10 +664,13 @@ function drawIntroCountdown() {
 
   // 上の "GET READY" は常に出す
   ctx.font = `900 24px system-ui, sans-serif`;
-  ctx.lineWidth = IS_MOBILE ? 5 : 8;
-  ctx.strokeStyle = "rgba(0,0,0,0.65)";
-  ctx.strokeText("GET READY", w / 2, h / 2 - 110);
-  ctx.fillStyle = "rgba(255,255,255,0.98)";
+
+  if (!IS_MOBILE) {
+    ctx.lineWidth = 8;
+    ctx.strokeStyle = "rgba(0,0,0,0.65)";
+    ctx.strokeText("GET READY", w / 2, h / 2 - 110);
+  }
+  ctx.fillStyle = "rgba(20,20,20,0.92)";
   ctx.fillText("GET READY", w / 2, h / 2 - 110);
 
   // 待機中(最初の2秒)は数字を描かずに終了
@@ -621,10 +683,13 @@ function drawIntroCountdown() {
   const text = isGo ? "GO!" : String(n);
 
   ctx.font = `${Math.floor((IS_MOBILE ? 100 : 120) * pulse)}px system-ui, sans-serif`;
-  ctx.lineWidth = IS_MOBILE ? 10 : 14;
-  ctx.strokeStyle = "rgba(0,0,0,0.65)";
-  ctx.strokeText(text, w / 2, h / 2);
-  ctx.fillStyle = "rgba(255,255,255,0.98)";
+
+  if (!IS_MOBILE) {
+    ctx.lineWidth = 14;
+    ctx.strokeStyle = "rgba(0,0,0,0.65)";
+    ctx.strokeText(text, w / 2, h / 2);
+  }
+  ctx.fillStyle = "rgba(20,20,20,0.92)";
   ctx.fillText(text, w / 2, h / 2);
 
   ctx.restore();
@@ -645,7 +710,9 @@ function draw() {
   ctx.translate(ox, oy);
 
   ctx.clearRect(-20, -20, w + 40, h + 40);
-  ctx.fillStyle = "#0b0f1a";
+
+  // ---- Background (pale gray) ----
+  ctx.fillStyle = "#e9edf2";
   ctx.fillRect(0, 0, w, h);
 
   // ---- particles: sprite draw (fast) ----
@@ -654,12 +721,13 @@ function draw() {
       const a = 1 - (p.t / p.life);
       ctx.globalAlpha = a;
 
-      const r = (IS_MOBILE ? 8 : 10) * a + 2; // 2..12
+      const r = (IS_MOBILE ? 7 : 9) * a + 2; // 2..11
       ctx.drawImage(dotSprite, p.x - r, p.y - r, r * 2, r * 2);
     }
     ctx.globalAlpha = 1;
   }
 
+  // ---- floaters (skip strokeText on mobile) ----
   for (const ft of state.floaters) {
     const p = ft.t / ft.life;
     const ease = 1 - Math.pow(1 - p, 3);
@@ -672,11 +740,13 @@ function draw() {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
 
-    ctx.lineWidth = IS_MOBILE ? 4 : 8;
-    ctx.strokeStyle = "rgba(0,0,0,0.60)";
-    ctx.strokeText(ft.text, xx, yy);
+    if (!IS_MOBILE) {
+      ctx.lineWidth = 8;
+      ctx.strokeStyle = "rgba(0,0,0,0.28)";
+      ctx.strokeText(ft.text, xx, yy);
+    }
 
-    ctx.fillStyle = "rgba(255,255,255,0.98)";
+    ctx.fillStyle = "rgba(20,20,20,0.92)";
     ctx.fillText(ft.text, xx, yy);
   }
   ctx.globalAlpha = 1;
@@ -687,13 +757,15 @@ function draw() {
   const pop = (f.scalePop > 0) ? (1 + 0.18 * (f.scalePop / 0.20)) : 1;
   const size = (f.r * 2) * pop;
 
-  ctx.globalAlpha = 0.25;
+  // shadow
+  ctx.globalAlpha = 0.18;
   ctx.beginPath();
   ctx.ellipse(f.x, f.y + f.r * 0.78, f.r * 0.95, f.r * 0.35, 0, 0, Math.PI * 2);
   ctx.fillStyle = "#000000";
   ctx.fill();
   ctx.globalAlpha = 1;
 
+  // face circle clipped image
   ctx.save();
   ctx.beginPath();
   ctx.arc(f.x, f.y, (f.r * pop), 0, Math.PI * 2);
@@ -701,8 +773,9 @@ function draw() {
   ctx.drawImage(img, f.x - size / 2, f.y - size / 2, size, size);
   ctx.restore();
 
+  // rim
   ctx.lineWidth = 4;
-  ctx.strokeStyle = "rgba(255,255,255,0.22)";
+  ctx.strokeStyle = "rgba(0,0,0,0.10)";
   ctx.beginPath();
   ctx.arc(f.x, f.y, (f.r * pop), 0, Math.PI * 2);
   ctx.stroke();
@@ -713,6 +786,7 @@ function draw() {
 
   ctx.restore();
 
+  // ---- HUD ----
   ctx.save();
   ctx.globalAlpha = 0.95;
   ctx.textAlign = "right";
@@ -728,10 +802,13 @@ function draw() {
 
   function drawHudText(text, x, y, font) {
     ctx.font = font;
-    ctx.lineWidth = IS_MOBILE ? 4 : 6;
-    ctx.strokeStyle = "rgba(0,0,0,0.60)";
-    ctx.strokeText(text, x, y);
-    ctx.fillStyle = "white";
+
+    if (!IS_MOBILE) {
+      ctx.lineWidth = 6;
+      ctx.strokeStyle = "rgba(0,0,0,0.25)";
+      ctx.strokeText(text, x, y);
+    }
+    ctx.fillStyle = "rgba(20,20,20,0.92)";
     ctx.fillText(text, x, y);
   }
 
@@ -746,16 +823,28 @@ function draw() {
   }
 
   ctx.restore();
+
+  // ---- DOM update once per frame ----
+  if (scoreDirty) {
+    elScore.textContent = String(state.score);
+    scoreDirty = false;
+  }
 }
 
 function loop(t) {
   if (!state.running) return;
+
   const dt = clamp((t - state.lastT) / 1000, 0, 0.033);
   state.lastT = t;
 
   update(dt);
+
   if (state.running) {
     draw();
+
+    // unlock hit once per frame
+    hitLock = false;
+
     requestAnimationFrame(loop);
   }
 }

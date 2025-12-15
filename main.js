@@ -19,6 +19,7 @@
 //   - RESULT画面は「結果BOX」+「ランキングBOX」の2箱縦並び
 //   - 1ゲーム1回だけ送信（多重送信防止）
 //   - ランキングBOXはスクロール、RETRYは常に押せる
+//   - ★RESULT時は「更新」ボタンを消す（被り/誤操作防止）
 // - Finish hold:
 //   - タイムアップ直後に FINISH!! を表示して 2秒待ってから結果画面へ（誤タップ防止）
 // - RESULT scroll fix:
@@ -48,6 +49,8 @@ const BEST_KEY = "facebop_best_v4";
 function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 function rand(a, b) { return a + Math.random() * (b - a); }
 
+const RANK_LIMIT = 100;
+
 // ---- Mobile detect & viewport size ----
 const IS_MOBILE = matchMedia("(pointer: coarse)").matches;
 
@@ -62,7 +65,7 @@ async function submitScore(name, score) {
   return r.json();
 }
 
-async function fetchTop(limit = 20) {
+async function fetchTop(limit = 1) {
   const r = await fetch(`${API_BASE}/top?limit=${limit}`);
   return r.json();
 }
@@ -117,19 +120,15 @@ function createRankBox(kind /* "inline" | "modal" */) {
   input.style.background = "rgba(0,0,0,0.25)";
   input.style.color = "rgba(255,255,255,0.95)";
   input.style.outline = "none";
-  input.style.minWidth = "0"; // grid内で潰れても重なりにくくする
+  input.style.minWidth = "0";
+  input.style.boxSizing = "border-box";
   row.appendChild(input);
 
   // ★ iOSでキーボード表示時に画面が暴れるのを抑える
-  input.addEventListener("focus", () => {
-    lockOverlayToVisualViewport();
-  }, { passive: true });
+  input.addEventListener("focus", () => { lockOverlayToVisualViewport(); }, { passive: true });
+  input.addEventListener("blur",  () => { lockOverlayToVisualViewport(); }, { passive: true });
 
-  input.addEventListener("blur", () => {
-    lockOverlayToVisualViewport();
-  }, { passive: true });
-
-  // ★ズーム抑制＆入力補助OFF（地味に効く）
+  // ★ズーム抑制＆入力補助OFF
   input.style.fontSize = "16px";
   input.inputMode = "text";
   input.autocapitalize = "none";
@@ -175,13 +174,11 @@ function createRankBox(kind /* "inline" | "modal" */) {
   list.style.display = "grid";
   list.style.gap = "6px";
 
-  // 縦スクロール
   list.style.maxHeight = (kind === "modal") ? "52vh" : "26vh";
   list.style.overflowY = "auto";
   list.style.overflowX = "hidden";
   list.style.webkitOverflowScrolling = "touch";
   list.style.touchAction = "pan-y";
-
   box.appendChild(list);
 
   return box;
@@ -198,33 +195,51 @@ function getRankEls(box) {
   };
 }
 
+// ★送信モードでは「更新」を消し、縦並びにして被り回避
 function setRankingModeOnBox(box, mode /* "view" | "submit" */) {
   const { row, input, send, refresh, msg } = getRankEls(box);
   if (!row || !input || !send || !refresh || !msg) return;
 
   if (mode === "view") {
-    row.style.gridTemplateColumns = "minmax(0, 1fr) auto auto";
+    // STARTモーダル閲覧
+    row.style.display = "grid";
+    row.style.gridTemplateColumns = "minmax(0, 1fr) auto";
+    row.style.gap = "8px";
+
     input.style.display = "none";
     send.style.display = "none";
     refresh.style.display = "inline-block";
+    refresh.textContent = "更新";
     msg.textContent = "ランキング表示（更新できます）";
-  } else {
-    row.style.gridTemplateColumns = "1fr auto auto";
-    input.style.display = "block";
-    send.style.display = "inline-block";
-    refresh.style.display = "inline-block";
-    input.disabled = false;
+    return;
+  }
 
-    if (state.rankSubmitted) {
-      send.disabled = true;
-      send.textContent = "送信済み";
-      input.disabled = true;
-      msg.textContent = "送信済み！（この回は1回だけ）";
-    } else {
-      send.disabled = false;
-      send.textContent = "送信";
-      msg.textContent = "送信してランキングに参加しよう！";
-    }
+  // RESULT送信
+  row.style.display = "grid";
+  row.style.gridTemplateColumns = "1fr";
+  row.style.gap = "8px";
+
+  input.style.display = "block";
+  input.style.width = "100%";
+
+  // ★更新ボタンはRESULTでは使わない（被り/誤操作防止）
+  refresh.style.display = "none";
+
+  // 送信ボタンは幅100%
+  send.style.display = "block";
+  send.style.width = "100%";
+
+  input.disabled = false;
+
+  if (state.rankSubmitted) {
+    send.disabled = true;
+    send.textContent = "送信済み";
+    input.disabled = true;
+    msg.textContent = "送信済み！（この回は1回だけ）";
+  } else {
+    send.disabled = false;
+    send.textContent = "送信";
+    msg.textContent = "送信してランキングに参加しよう！";
   }
 }
 
@@ -249,7 +264,8 @@ async function refreshRankingOnBox(box, limit = 20) {
     }
 
     if (msg) {
-      msg.textContent = state.rankSubmitted ? "送信済み！" : "ランキング表示中（更新できます）";
+      if (state.rankSubmitted) msg.textContent = "送信済み！（この回は1回だけ）";
+      else msg.textContent = "ランキング表示中";
     }
   } catch (e) {
     console.error(e);
@@ -286,7 +302,7 @@ async function submitMyScoreOnBox(box, finalScore) {
     if (input) input.disabled = true;
     if (msg) msg.textContent = "送信OK！ランキング更新中…";
 
-    await refreshRankingOnBox(box, 20);
+    await refreshRankingOnBox(box, RANK_LIMIT);
 
     if (msg) msg.textContent = "送信済み！（この回は1回だけ）";
   } catch (e) {
@@ -351,12 +367,15 @@ function ensureRankModal() {
   close.style.width = "40px";
   close.style.height = "40px";
   close.style.borderRadius = "12px";
-  close.style.border = "1px solid rgba(255,255,255,0.18)";
-  close.style.background = "rgba(255,255,255,0.10)";
+  close.style.border = "1px solid rgba(255,255,255,0.25)";
+  close.style.background = "rgba(32,34,38,1)";
   close.style.color = "rgba(255,255,255,0.95)";
   close.style.fontSize = "22px";
   close.style.fontWeight = "900";
   close.style.cursor = "pointer";
+  close.style.boxShadow = "0 6px 16px rgba(0,0,0,0.45)";
+  close.style.zIndex = "9999";
+  close.style.pointerEvents = "auto";
   close.onclick = () => closeRankModal();
   panel.appendChild(close);
 
@@ -382,7 +401,7 @@ function openRankModal(mode /* "view" | "submit" */) {
   ensureRankModal();
   setRankingModeOnBox(rankModalBox, mode);
   rankModal.style.display = "flex";
-  refreshRankingOnBox(rankModalBox, 20);
+  refreshRankingOnBox(rankModalBox, RANK_LIMIT);
 }
 
 function closeRankModal() {
@@ -410,7 +429,6 @@ function lockOverlayToVisualViewport() {
   overlay.style.height = vv.height + "px";
 }
 
-
 function fitCanvas() {
   const { w, h } = getViewportSize();
   const dpr = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
@@ -420,21 +438,17 @@ function fitCanvas() {
   canvas.height = Math.floor(h * dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
-window.addEventListener("resize", fitCanvas, { passive: true });
-window.visualViewport?.addEventListener("resize", fitCanvas, { passive: true });
 
-window.visualViewport?.addEventListener("resize", () => {
-  // キーボード表示/非表示でviewportが変わるのでoverlayも追従
+// ★ resize/scroll はここに統合（重複を削除、挙動は同じ）
+function onViewportChanged() {
+  fitCanvas();
   lockOverlayToVisualViewport();
-}, { passive: true });
+}
+window.addEventListener("resize", onViewportChanged, { passive: true });
+window.visualViewport?.addEventListener("resize", onViewportChanged, { passive: true });
+window.visualViewport?.addEventListener("scroll", onViewportChanged, { passive: true });
 
-window.visualViewport?.addEventListener("scroll", () => {
-  // iOS SafariでoffsetTopが変わることがあるので追従
-  lockOverlayToVisualViewport();
-}, { passive: true });
-
-fitCanvas();
-lockOverlayToVisualViewport();
+onViewportChanged();
 
 // ---- particle sprite (fast) ----
 let dotSprite = null;
@@ -613,7 +627,7 @@ async function ensureAudio() {
       audioCtx = null;
       gainBgm = null;
       gainSe = null;
-      buffers = { hit01: null, hit02: null, count: null, finish: null, bgm: null }; // ★FIX
+      buffers = { hit01: null, hit02: null, count: null, finish: null, bgm: null };
       bgmSource = null;
       throw e;
     }
@@ -722,7 +736,6 @@ function renderResultWithPack(score) {
   wrap.style.gap = "10px";
   wrap.style.justifyItems = "center";
 
-  // 画像読み込み中の違和感防止
   const needsImg = !!(pack && pack.img);
   if (needsImg) wrap.style.visibility = "hidden";
 
@@ -801,7 +814,6 @@ const state = {
   countPlayed: false,
   goHold: 0,
 
-  // --- finish hold ---
   finishHold: 0,
   finishTextTimer: 0,
 
@@ -896,6 +908,15 @@ function stopFever() {
   state.scoreMul = 1;
 }
 
+function setOverlayCenteredLayout() {
+  overlay.style.display = "flex";
+  overlay.style.flexDirection = "column";
+  overlay.style.alignItems = "center";
+  overlay.style.justifyContent = "center";
+  overlay.style.padding = "18px";
+  overlay.style.boxSizing = "border-box";
+}
+
 function resetGameForIntro(introSeconds) {
   state.phase = "intro";
   state.introTotal = introSeconds;
@@ -903,7 +924,6 @@ function resetGameForIntro(introSeconds) {
   state.countPlayed = false;
   state.goHold = 0;
 
-  // finish reset
   state.finishHold = 0;
   state.finishTextTimer = 0;
 
@@ -923,11 +943,10 @@ function resetGameForIntro(introSeconds) {
   state.feverBurst = 0;
   state.hueTime = 0;
 
-  // 新ゲーム開始 → 送信状態リセット
   state.rankSubmitted = false;
   state.rankSubmitting = false;
 
-  // ★STARTでは中央寄せ＆スクロール無効に戻す（RESULTスクロール対策の復帰）
+  // ★STARTでは中央寄せ＆スクロール無効に戻す
   overlay.style.justifyContent = "center";
   overlay.style.overflowY = "hidden";
 
@@ -949,7 +968,6 @@ function resetGameForIntro(introSeconds) {
   state.face.hitTimer = 0;
   state.face.scalePop = 0;
 
-  // START/プレイ中は右上RANKボタンを表示
   setRankCornerButtonVisible(true);
 
   elScore.textContent = "0";
@@ -988,7 +1006,7 @@ function pointInFace(px, py) {
 }
 
 function endGame() {
-  overlay.style.display = "flex"; // overlay を flex運用してるので
+  overlay.style.display = "flex";
 
   // ★ RESULTでは上寄せにしてスクロールできるようにする（重要）
   overlay.style.justifyContent = "flex-start";
@@ -1011,7 +1029,6 @@ function endGame() {
 
   // RESULTでは右上RANKボタンを消す（下にランキングがあるため）
   setRankCornerButtonVisible(false);
-
 
   // RESULT画面：2箱縦並び（結果BOX + ランキングBOX）
   resultEl.textContent = "";
@@ -1039,7 +1056,7 @@ function endGame() {
   const { send } = getRankEls(box);
   if (send) send.onclick = () => submitMyScoreOnBox(box, state.score);
 
-  refreshRankingOnBox(box, 20);
+  refreshRankingOnBox(box, RANK_LIMIT);
 
   btn.textContent = "RETRY";
 
@@ -1257,7 +1274,6 @@ function update(dt) {
     state.finishHold = Math.max(0, state.finishHold - dt);
     state.finishTextTimer = Math.max(0, state.finishTextTimer - dt);
 
-    // 演出中は軽い更新だけ（誤タップ防止）
     updateParticles(dt);
     updateFloaters(dt);
 
@@ -1272,13 +1288,12 @@ function update(dt) {
     state.timeLeft = 0;
     elTime.textContent = "0.0";
 
-    // 2秒待ってから結果へ（誤タップ防止）
     state.phase = "finish";
     state.finishHold = 2.0;
     state.finishTextTimer = 1.2;
     state.shake = Math.max(state.shake, IS_MOBILE ? 0.18 : 0.22);
 
-    playFinish(); // FINISH専用SE
+    playFinish();
     const { w, h } = getViewportSize();
     addFloater("FINISH!!", w / 2, h / 2, {
       size: IS_MOBILE ? 56 : 72,
@@ -1542,16 +1557,16 @@ function loop(t) {
   }
 }
 
-// ★overlay を必ず最前面に出す（START画面が消える主因＝z-index負け対策）
+// ★overlay を必ず最前面に出す
 canvas.style.position = "fixed";
 canvas.style.inset = "0";
 canvas.style.zIndex = "1";
-canvas.style.touchAction = "none"; // ★重要：スクロール操作をcanvasが奪わない
+canvas.style.touchAction = "none"; // canvasがスクロールを奪わない
 
 overlay.style.position = "fixed";
 overlay.style.inset = "0";
 overlay.style.zIndex = "50";
-overlay.style.pointerEvents = "auto"; // 念のため
+overlay.style.pointerEvents = "auto";
 
 // ---- initial overlay ----
 overlay.classList.remove("hidden");
@@ -1559,23 +1574,26 @@ titleEl.textContent = "Atack Oohigashi!!";
 resultEl.textContent = "STARTを押してね";
 btn.textContent = "START";
 
-// ★canvas / overlay の前後関係を固定（前回の対策を維持）
-canvas.style.position = "fixed";
-canvas.style.inset = "0";
-canvas.style.zIndex = "1";
-canvas.style.touchAction = "none";
+// ★ START / RETRY ボタンをタップしやすく（挙動は不変）
+btn.style.minWidth = "140px";
+btn.style.padding = "14px 22px";
+btn.style.fontSize = "16px";
+btn.style.fontWeight = "800";
+btn.style.borderRadius = "12px";
+btn.style.border = "1px solid rgba(255,255,255,0.25)";
+btn.style.background = "rgba(255,255,255,0.95)";
+btn.style.color = "#000";
+btn.style.cursor = "pointer";
 
-overlay.style.position = "fixed";
-overlay.style.inset = "0";
-overlay.style.zIndex = "50";
-overlay.style.pointerEvents = "auto";
+// モバイルはさらに大きく
+if (IS_MOBILE) {
+  btn.style.minWidth = "180px";
+  btn.style.padding = "16px 26px";
+  btn.style.fontSize = "18px";
+}
 
 // ★overlay は「画面中央寄せ」
-overlay.style.display = "flex";
-overlay.style.alignItems = "center";
-overlay.style.justifyContent = "center";
-overlay.style.padding = "18px";
-overlay.style.boxSizing = "border-box";
+setOverlayCenteredLayout();
 
 // ★START箱（パネル）を作って、中に title/result/button をまとめる
 (function ensureStartPanel() {
@@ -1594,95 +1612,46 @@ overlay.style.boxSizing = "border-box";
     panel.style.display = "grid";
     panel.style.gap = "10px";
     panel.style.justifyItems = "center";
-    panel.style.position = "relative"; // ← RANKボタンを箱の右上に置く
+    panel.style.position = "relative";
     panel.style.color = "rgba(255,255,255,0.95)";
 
-    // ★ panel自体をスクロール可能にする（RESULTで中身がはみ出してもOK）
+    // panel自体をスクロール可能にする（RESULTで中身がはみ出してもOK）
     panel.style.maxHeight = "min(86vh, 760px)";
     panel.style.overflowY = "auto";
     panel.style.webkitOverflowScrolling = "touch";
     panel.style.touchAction = "pan-y";
 
     while (overlay.firstChild) overlay.removeChild(overlay.firstChild);
-    // overlayを一旦空にして、panelを載せる
     overlay.appendChild(panel);
   }
 
-  // ★既存DOMを panel 内へ移動
   panel.appendChild(titleEl);
   panel.appendChild(resultEl);
   panel.appendChild(btn);
 
-  // ★result領域は STARTではスクロールさせない（モーダルで見る）
   resultEl.style.width = "100%";
   resultEl.style.maxHeight = "";
   resultEl.style.overflow = "";
   resultEl.style.paddingBottom = "";
 
-  // ★ボタン配置
   btn.style.marginTop = "6px";
   btn.style.position = "relative";
   btn.style.zIndex = "5";
 
-  // ===== FIX: overlay / panel centering + text alignment =====
-  (function forceCenterFix() {
-    // overlayを visualViewport に合わせて「本当に中央」にする（iOS/PC両対応）
-    const vv = window.visualViewport;
-    const W = vv ? vv.width  : window.innerWidth;
-    const H = vv ? vv.height : window.innerHeight;
-    const top = vv ? vv.offsetTop  : 0;
-    const left= vv ? vv.offsetLeft : 0;
+  // 表示統一（値は元と同じ）
+  panel.style.textAlign = "center";
+  panel.style.justifyItems = "center";
+  [titleEl, resultEl].forEach(el => {
+    if (!el) return;
+    el.style.width = "100%";
+    el.style.textAlign = "center";
+    el.style.marginLeft = "0";
+    el.style.marginRight = "0";
+  });
+  if (btn) btn.style.alignSelf = "center";
 
-    overlay.style.position = "fixed";
-    overlay.style.left = left + "px";
-    overlay.style.top  = top  + "px";
-    overlay.style.width  = W + "px";
-    overlay.style.height = H + "px";
-
-    overlay.style.display = "flex";
-    overlay.style.flexDirection = "column";
-    overlay.style.alignItems = "center";
-    overlay.style.justifyContent = "center";
-    overlay.style.padding = "18px";
-    overlay.style.boxSizing = "border-box";
-
-    // panel内のテキストが左寄りになるのを強制で潰す
-    const panel = document.getElementById("startPanel");
-    if (panel) {
-      panel.style.textAlign = "center";
-      panel.style.justifyItems = "center";
-    }
-
-    // title/result/button を中央寄せ + 余計なmargin消し
-    [titleEl, resultEl].forEach(el => {
-      if (!el) return;
-      el.style.width = "100%";
-      el.style.textAlign = "center";
-      el.style.marginLeft = "0";
-      el.style.marginRight = "0";
-    });
-
-    if (btn) {
-      btn.style.alignSelf = "center";
-    }
-  })();
-
-  // resizeでも追従
-  window.visualViewport?.addEventListener("resize", () => {
-    const panel = document.getElementById("startPanel");
-    if (!panel) return;
-    // 上と同じ処理をもう一回走らせる（軽いのでOK）
-    const vv = window.visualViewport;
-    const W = vv ? vv.width  : window.innerWidth;
-    const H = vv ? vv.height : window.innerHeight;
-    const top = vv ? vv.offsetTop  : 0;
-    const left= vv ? vv.offsetLeft : 0;
-    overlay.style.left = left + "px";
-    overlay.style.top  = top  + "px";
-    overlay.style.width  = W + "px";
-    overlay.style.height = H + "px";
-  }, { passive: true });
-
+  // overlay の位置・サイズは onViewportChanged 経由で常に同期
+  lockOverlayToVisualViewport();
 })();
 
 // ★モーダルは先に作っておく

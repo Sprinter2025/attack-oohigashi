@@ -1,1 +1,1 @@
-# Atack the oohigashi!!!
+# Atack oohigashi!!!

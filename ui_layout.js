@@ -64,7 +64,7 @@ overlay.style.pointerEvents = "auto";
 
 // ---- initial overlay ----
 overlay.classList.remove("hidden");
-titleEl.textContent = "Atack Oohigashi!!";
+titleEl.textContent = "Attack Oohigashi!!";
 resultEl.textContent = "STARTを押してね";
 btn.textContent = "START";
 
